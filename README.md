@@ -1,2 +1,2 @@
 # davidson_solver
-A modern Fortran implementation of Davidson's method of dense matrix diagonalisation
+A modern Fortran implementation of Davidson's method of sparse matrix diagonalisation
