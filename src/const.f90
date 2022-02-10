@@ -11,4 +11,6 @@ module const
 
    integer, parameter :: p = dp
 
+   real(dp) :: depsilon = 1.e-12_p
+
 end module const

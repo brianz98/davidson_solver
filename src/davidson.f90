@@ -5,34 +5,40 @@ module davidson
 
    contains
 
-   subroutine davidson_solver(A, eigval, nTrial, maxSize, tol)
+   subroutine davidson_solver(A, eigval, ntrial, maxSize, tol, maxiter)
       ! The Davidson's method
-      use linalg, only: qr_wrapper, dgemm_wrapper, eigs_wrapper
+      use linalg, only: qr_wrapper, dgemm_wrapper, eigs_wrapper, dgemv_wrapper
       use error_handling, only: check_allocate
 
       real(p), intent(inout) :: A(:,:)
       real(p), intent(out) :: eigval(:)
       real(p), intent(in) :: tol
-      integer, intent(in) :: nTrial, maxsize
+      integer, intent(in) :: ntrial, maxsize, maxiter
 
-      integer :: nEig, dimA, maxEig, ierr
+      integer :: nEig, dimA, maxguess, ierr, nactive
       integer :: i, j
-      real(p), allocatable :: V(:,:), theta(:), theta_old(:), tmp(:,:), tmpV(:), eye(:,:), T(:,:), w(:)
+      integer, parameter :: iunit = 6
+      real(p), allocatable :: V(:,:), theta(:), theta_old(:), tmp(:,:), tmpV(:), T(:,:), w(:), V_coll(:,:)
+      logical, allocatable :: normconv(:)
+      logical :: conv
+      real(p) :: norm
 
       nEig = size(eigval); dimA = size(A, dim=1)
       allocate(theta_old(nEig), source=0.0_p)
+      allocate(normconv(ntrial))
 
       ! Integer division always rounds towards zero, i.e 8*50/8 = 48
-      maxEig = nTrial*(maxSize/nTrial)
-      allocate(theta(maxEig))
-      allocate(V(dimA,maxEig+nTrial),source=0.0_p,stat=ierr)
-      call check_allocate('V',dimA*(maxEig+nTrial),ierr)
+      maxguess = ntrial*(maxSize/ntrial)
+      allocate(theta(maxguess))
+      allocate(V(dimA,maxguess+ntrial),source=0.0_p,stat=ierr)
+      call check_allocate('V',dimA*(maxguess+ntrial),ierr)
+      allocate(V_coll(dimA,ntrial),source=0.0_p,stat=ierr)
 
-      allocate(T(maxEig,maxEig),source=0.0_p,stat=ierr)
-      call check_allocate('T',maxEig**2,ierr)
+      allocate(T(maxguess,maxguess),source=0.0_p,stat=ierr)
+      call check_allocate('T',maxguess**2,ierr)
 
       allocate(tmp,source=V,stat=ierr)
-      call check_allocate('tmp',dimA*maxEig,ierr)
+      call check_allocate('tmp',dimA*maxguess,ierr)
 
       allocate(tmpV(dimA),source=0.0_p,stat=ierr)
       call check_allocate('tmpV',dimA,ierr)
@@ -40,38 +46,72 @@ module davidson
       allocate(w(dimA),source=0.0_p,stat=ierr)
       call check_allocate('w',dimA,ierr)
 
-      allocate(eye(dimA,dimA),source=0.0_p,stat=ierr)
-      call check_allocate('eye',dimA**2,ierr)
-      do i = 1, dimA
-         eye(i,i) = 1.0_p
-      end do
-
-      ! Initial guesses are nTrial lowest unit vectors
-      do i = 1, nTrial
+      ! Initial guesses are ntrial lowest unit vectors
+      do i = 1, ntrial
          V(i,i) = 1.0_p
       end do
 
-      do i = nTrial*2, maxSize, nTrial
-         ! V is only passed in by reference, and (dimA, i) specifies the slice that should be worked on
-         call qr_wrapper(V, dimA, i)
+      nactive = ntrial
+      conv = .false.
 
-         ! Likewise, tmp is designed to hold the largest tmp matrix but only the relevant slice will be written to
-         call dgemm_wrapper('N', 'N', dimA, i, dimA, A, V, tmp)
-         call dgemm_wrapper('T', 'N', i, i, dimA, V, tmp, T)
+      do i = 1, maxiter
+         ! Orthonormalise the current set of guess vectors
+         call qr_wrapper(V, dimA, nactive)
 
-         call eigs_wrapper(T, i, theta, ierr)
+         ! Form the subspace Hamiltonian / Rayleigh matrix
+         ! T = V^T A V
+         call dgemm_wrapper('N', 'N', dimA, nactive, dimA, A, V, tmp)
+         call dgemm_wrapper('T', 'N', nactive, nactive, dimA, V, tmp, T)
 
-         do j = 1, nTrial
-            call dgemm_wrapper('N','N',dimA,1,i,V,T,tmpV)
-            call dgemm_wrapper('N','N',dimA,1,dimA,(A-theta(j)*eye),tmpV,w)
-            w = w/(theta(j)-A(j,j))
-            V(:,(i+j)) = w
-         end do
+         ! Diagonalise the subspace Hamiltonian
+         ! T C = C t (T gets overwritten by C in syev, theta is the diagonal of t)
+         call eigs_wrapper(T, nactive, theta, ierr)
 
-         if (sqrt(sum((theta(1:nEig)-theta_old)**2)) < tol) exit
+         ! We don't use this norm for convergence checking as after each subspace collapse the change in norm is 
+         ! essentially zero, but we report it nonetheless as during each restart-block it is still 
+         ! a useful measure of convergence.
+         norm = sqrt(sum((theta(1:nEig)-theta_old)**2))
+         write(iunit,'(1X, A, I3, A, I3, A, ES15.6)') 'Iteration ', i, ', basis size ', nactive, ', rmsE ', norm
          theta_old = theta(1:nEig)
+
+         if (all(normconv)) then
+            write(iunit,'(1X, A, ES10.4, A)') 'Residue tolerance of ', tol,' reached, printing results...'
+            conv = .true.
+            exit
+         end if
+
+         if (nactive <= (maxguess-ntrial)) then
+            ! If the number of guess vectors can be grown by at least another lot of ntrial
+            do j = 1, ntrial
+               ! Residue vector w = (A-theta(j)*I) V T(:,j)
+               ! Storing a diagonal matrix as large as A is obviously a bad idea, so we use a tmp vector
+               ! Technically speaking, tmpV is the 'Ritz vector' and w is the residue vector
+               call dgemv_wrapper(dimA, nactive, V, T(:,j), tmpV)
+               call dgemv_wrapper(dimA, dimA, A, tmpV, w)
+               w = w - theta(j)*tmpV
+               if (sqrt(sum(w**2)) < tol) normconv(j) = .true.
+               ! Precondition the residue vector to form the correction vector,
+               ! if preconditioner = 1, we recover the Lanczos algorithm.
+               if (abs((theta(j)-A(j,j))) < depsilon) then
+                   w = w/(theta(j) - A(j,j) + 0.01)
+               else
+                   w = w/(theta(j)-A(j,j))
+               end if
+               V(:,(nactive+j)) = w
+            end do
+            nactive = nactive + ntrial
+         else
+            ! We need to collapse the subspace into ntrial best guesses and restart the iterations
+            ! V holds the approximate eigenvectors and T holds the CI coefficients,
+            ! so one call to gemm gives us the actual guess vectors.
+            write(iunit, '(1X, A)') 'Collapsing subspace...'
+            call dgemm_wrapper('N', 'N', dimA, ntrial, maxguess, V, T, V_coll)
+            V(:,:ntrial) = V_coll
+            nactive = ntrial
+         end if
       end do
 
+      if (conv .eqv. .false.) write(iunit, *) 'Davidson did not converge'
       eigval = theta(1:nEig)
 
    end subroutine

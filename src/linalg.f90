@@ -54,6 +54,15 @@ module linalg
                     A, LDA, B, LDB, 0.0_p, C, outer_row)
       end subroutine dgemm_wrapper
 
+      subroutine dgemv_wrapper(row, col, A, x, y)
+
+         integer, intent(in) :: row, col
+         real(dp), intent(in) :: A(row,*), x(*)
+         real(dp), intent(inout) :: y(*)
+
+         call dgemv('N', row, col, 1.0_dp, A, row, x, 1, 0.0_dp, y, 1)
+      end subroutine dgemv_wrapper
+
       subroutine qr_wrapper(A, rowA, colA)
          ! Wrapper around dgeqrf and dorgqr with only the information we need
          ! On exit the matrix A is the orthonormalised matrix Q
