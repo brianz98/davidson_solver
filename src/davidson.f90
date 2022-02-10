@@ -7,6 +7,11 @@ module davidson
 
    subroutine davidson_solver(A, eigval, ntrial, maxSize, tol, maxiter)
       ! The Davidson's method
+      
+#ifdef GPU
+      use cublas_v2
+#endif
+
       use linalg, only: qr_wrapper, dgemm_wrapper, eigs_wrapper, dgemv_wrapper
       use error_handling, only: check_allocate
 
@@ -22,6 +27,12 @@ module davidson
       logical, allocatable :: normconv(:)
       logical :: conv
       real(p) :: norm
+
+#ifdef GPU
+      real(p), device, allocatable :: A_d(:,:), V_d(:,:), tmp_d(:,:), tmpV_d(:), w_d(:)
+      type(cublasHandle) :: h
+      integer(4) :: istat
+#endif
 
       nEig = size(eigval); dimA = size(A, dim=1)
       allocate(theta_old(nEig), source=0.0_p)
@@ -46,6 +57,16 @@ module davidson
       allocate(w(dimA),source=0.0_p,stat=ierr)
       call check_allocate('w',dimA,ierr)
 
+#ifdef GPU
+      allocate(A_d(dimA, dimA))
+      allocate(V_d(dimA,maxguess+ntrial))
+      allocate(tmp_d(dimA,maxguess+ntrial))
+      allocate(tmpV_d(dimA))
+      allocate(w_d(dimA))
+
+      A_d = A
+#endif
+
       ! Initial guesses are ntrial lowest unit vectors
       do i = 1, ntrial
          V(i,i) = 1.0_p
@@ -60,7 +81,14 @@ module davidson
 
          ! Form the subspace Hamiltonian / Rayleigh matrix
          ! T = V^T A V
+#ifdef GPU
+         V_d = V
+         istat = cublasDgemm(h, 'N', 'N', dimA, nactive, dimA, 1.0_p, A_d, dimA, V_d, dimA, 0.0_p, tmp_d, dimA)
+         if (istat .ne. 0) write(iunit,*) 'cublasDgemm error! Returned ',istat
+         tmp = tmp_d
+#else
          call dgemm_wrapper('N', 'N', dimA, nactive, dimA, A, V, tmp)
+#endif
          call dgemm_wrapper('T', 'N', nactive, nactive, dimA, V, tmp, T)
 
          ! Diagonalise the subspace Hamiltonian
@@ -87,7 +115,13 @@ module davidson
                ! Storing a diagonal matrix as large as A is obviously a bad idea, so we use a tmp vector
                ! Technically speaking, tmpV is the 'Ritz vector' and w is the residue vector
                call dgemv_wrapper(dimA, nactive, V, T(:,j), tmpV)
+#ifdef GPU
+                  istat = cublasDgemv(h, 'N', dimA, dimA, 1.0_p, A_d, dimA, tmpV, 1, 0.0_p, w_d, 1)
+                  if (istat .ne. 0) write(iunit,*) 'cublasDgemv error! Returned ',istat
+                  w = w_d
+#else
                call dgemv_wrapper(dimA, dimA, A, tmpV, w)
+#endif
                w = w - theta(j)*tmpV
                if (sqrt(sum(w**2)) < tol) normconv(j) = .true.
                ! Precondition the residue vector to form the correction vector,
@@ -113,6 +147,11 @@ module davidson
 
       if (conv .eqv. .false.) write(iunit, *) 'Davidson did not converge'
       eigval = theta(1:nEig)
+
+#ifdef GPU
+      istat = cublasDestroy(h)
+      if (istat .ne. 0) write(iunit, *) 'cublasDestroy error! Returned ',istat
+#endif
 
    end subroutine
 
